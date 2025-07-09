@@ -10,12 +10,12 @@ Este PR [adiciona/remove/corrige/substitui] o [feature/bug/etc].
 - 🍕 Feature
 - 🐛 Correção de Bug
 - 📝 Atualização de Documentação
-- � Estilo
+- 🎨 Estilo
 - 🧑‍💻 Refatoração de Código
-- 🔥 Melhorias de Performance
-- ✅ Teste
+- 🔥 Melhorias de Desempenho
+- ✅ Testes
 - 🤖 Build
-- 🔁 CI
+- 🔁 Integração Contínua (CI)
 - 📦 Tarefa (Release)
 - ⏩ Reverter
 
