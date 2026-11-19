@@ -40,15 +40,17 @@ on:
         description: Quanto esperar no total, contando a fila quando o Komodo está ocupado
         type: number
         default: 20
+    # Optional so a caller can merge before the org secrets exist: switched off, nothing reads them. Switched on,
+    # the step below refuses to run without all four.
     secrets:
       cf_access_client_id:
-        required: true
+        required: false
       cf_access_client_secret:
-        required: true
+        required: false
       komodo_api_key:
-        required: true
+        required: false
       komodo_api_secret:
-        required: true
+        required: false
 
 permissions: {}
 
@@ -80,6 +82,9 @@ jobs:
           case "$KOMODO_URL" in https://*) ;; *) echo "::error::komodo_url precisa começar com https:// (veio vazio? confira a variável da org)"; exit 1 ;; esac
           case "$PROCEDURE" in ''|*[!A-Za-z0-9._-]*) echo "::error::procedure inválida: [$PROCEDURE]"; exit 1 ;; esac
           case "$ESPERA" in ''|*[!0-9]*) echo "::error::espera_minutos inválido"; exit 1 ;; esac
+          for v in CF_ID CF_SECRET K_KEY K_SECRET; do
+            [ -n "${!v}" ] || { echo "::error::falta um dos quatro segredos (HMG_CF_ACCESS_CLIENT_ID, HMG_CF_ACCESS_CLIENT_SECRET, HMG_KOMODO_API_KEY, HMG_KOMODO_API_SECRET) para este repositório"; exit 1; }
+          done
           url=${KOMODO_URL%/}
 
           # The four secrets go to curl in a header file (never in its command line).
