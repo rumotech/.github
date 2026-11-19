@@ -133,6 +133,7 @@ jobs:
             if [ "$(jq -r '.success' "$resp")" = true ]; then
               seg=$(( $(date +%s) - inicio ))
               echo "ok: $PROCEDURE terminou em ${seg}s; a troca dos containers segue no Swarm"
+              # shellcheck disable=SC2016  # the backticks are Markdown for the job summary
               printf '### %s\n\nOk em %ss (execução `%s`). A troca dos containers segue no Swarm; se ela voltar atrás, o alerta do Komodo avisa.\n' \
                 "$PROCEDURE" "$seg" "$id" >> "$GITHUB_STEP_SUMMARY"
               exit 0
@@ -143,6 +144,7 @@ jobs:
             fi
             echo "::error::$PROCEDURE falhou (execução $id). Etapas com erro e o fim do log de cada uma:"
             jq -r '.logs[]? | select(.success == false) | "--- \(.stage)\n\((.stderr // "") | split("\n") | .[-25:] | join("\n"))"' "$resp"
+            # shellcheck disable=SC2016  # the backticks are Markdown for the job summary
             printf '### %s\n\nFalhou (execução `%s`). O log está no Komodo e no passo acima.\n' "$PROCEDURE" "$id" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           done
