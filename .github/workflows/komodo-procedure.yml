@@ -1,0 +1,150 @@
+name: komodo-procedure
+
+# Workflow comum: roda uma Procedure de um Komodo que fica atrás do Cloudflare Access e espera ela terminar.
+# Assim o commit que disparou mostra se o build, o pre deploy (as migrations) e o deploy da stack passaram.
+# Termina quando a Procedure termina, isto é, quando o `docker stack deploy` foi disparado. A troca dos
+# containers acontece depois, e quem avisa se ela volta atrás é o alerta do próprio Komodo.
+#
+# Genérico e público: o endereço do Komodo, a Procedure e a chave liga/desliga vêm de quem chama. Os quatro
+# segredos são um token de serviço do Access e a chave de API de um usuário de serviço do Komodo que só pode
+# executar as Procedures dele. Usado pelo deploy automático na homologação (AIR-673).
+#
+#   jobs:
+#     hmg:
+#       uses: rumotech/.github/.github/workflows/komodo-procedure.yml@main
+#       with:
+#         komodo_url: ${{ vars.HMG_KOMODO_URL }}
+#         procedure: deploy-sai-bot-api
+#         ligado: ${{ vars.DEPLOY_HMG }}
+#       secrets:
+#         cf_access_client_id: ${{ secrets.HMG_CF_ACCESS_CLIENT_ID }}
+#         cf_access_client_secret: ${{ secrets.HMG_CF_ACCESS_CLIENT_SECRET }}
+#         komodo_api_key: ${{ secrets.HMG_KOMODO_API_KEY }}
+#         komodo_api_secret: ${{ secrets.HMG_KOMODO_API_SECRET }}
+on:
+  workflow_call:
+    inputs:
+      komodo_url:
+        description: "https://<Komodo>, atrás do Cloudflare Access"
+        type: string
+        required: true
+      procedure:
+        description: Nome da Procedure no Komodo
+        type: string
+        required: true
+      ligado:
+        description: "Só 'ligado' chama o Komodo; qualquer outro valor (inclusive vazio) termina verde sem chamar"
+        type: string
+        required: true
+      espera_minutos:
+        description: Quanto esperar no total, contando a fila quando o Komodo está ocupado
+        type: number
+        default: 20
+    # Optional so a caller can merge before the org secrets exist: switched off, nothing reads them. Switched on,
+    # the step below refuses to run without all four.
+    secrets:
+      cf_access_client_id:
+        required: false
+      cf_access_client_secret:
+        required: false
+      komodo_api_key:
+        required: false
+      komodo_api_secret:
+        required: false
+
+permissions: {}
+
+jobs:
+  procedure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Desligado
+        if: inputs.ligado != 'ligado'
+        env:
+          LIGADO: ${{ inputs.ligado }}
+          PROCEDURE: ${{ inputs.procedure }}
+        run: |
+          echo "::notice::Deploy automático desligado (valor: '${LIGADO}'): a Procedure ${PROCEDURE} não foi chamada."
+
+      - name: Rodar a Procedure e esperar
+        if: inputs.ligado == 'ligado'
+        env:
+          KOMODO_URL: ${{ inputs.komodo_url }}
+          PROCEDURE: ${{ inputs.procedure }}
+          ESPERA: ${{ inputs.espera_minutos }}
+          CF_ID: ${{ secrets.cf_access_client_id }}
+          CF_SECRET: ${{ secrets.cf_access_client_secret }}
+          K_KEY: ${{ secrets.komodo_api_key }}
+          K_SECRET: ${{ secrets.komodo_api_secret }}
+        run: |
+          set -euo pipefail
+          case "$KOMODO_URL" in https://*) ;; *) echo "::error::komodo_url precisa começar com https:// (veio vazio? confira a variável da org)"; exit 1 ;; esac
+          case "$PROCEDURE" in ''|*[!A-Za-z0-9._-]*) echo "::error::procedure inválida: [$PROCEDURE]"; exit 1 ;; esac
+          case "$ESPERA" in ''|*[!0-9]*) echo "::error::espera_minutos inválido"; exit 1 ;; esac
+          for v in CF_ID CF_SECRET K_KEY K_SECRET; do
+            [ -n "${!v}" ] || { echo "::error::falta um dos quatro segredos (HMG_CF_ACCESS_CLIENT_ID, HMG_CF_ACCESS_CLIENT_SECRET, HMG_KOMODO_API_KEY, HMG_KOMODO_API_SECRET) para este repositório"; exit 1; }
+          done
+          url=${KOMODO_URL%/}
+
+          # The four secrets go to curl in a header file (never in its command line).
+          umask 077
+          cab="$RUNNER_TEMP/komodo-cabecalhos"
+          printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\nX-Api-Key: %s\nX-Api-Secret: %s\nContent-Type: application/json\n' \
+            "$CF_ID" "$CF_SECRET" "$K_KEY" "$K_SECRET" > "$cab"
+          resp="$RUNNER_TEMP/komodo-resposta.json"
+          chama() { # chama <path> <json>: prints the HTTP code; the body lands in $resp
+            curl -sS --max-time 30 --max-redirs 0 -o "$resp" -w '%{http_code}' -H @"$cab" -X POST --data "$2" "$url$1" 2>/dev/null || echo 000
+          }
+          recusa() { # recusa <code>: why the Access or Komodo said no, never the body of an HTML page
+            case "$1" in
+              000) echo "::error::sem resposta de $url (rede ou tempo esgotado)" ;;
+              301|302|303|307|308) echo "::error::o Access mandou para o login (HTTP $1): o token de serviço não passou (política Service Auth na aplicação do Access?)" ;;
+              401|403) echo "::error::recusado (HTTP $1): o anti-robô da Cloudflare, o Access ou a chave do Komodo. Confira a regra que pula o anti-robô em /execute e /read" ;;
+              *) echo "::error::HTTP $1 do Komodo: $(head -c 300 "$resp" 2>/dev/null | tr -d '\n')" ;;
+            esac
+          }
+          fim=$(( $(date +%s) + ESPERA * 60 ))
+          inicio=$(date +%s)
+          tentativa=0
+          while :; do
+            tentativa=$((tentativa + 1))
+            code=$(chama /execute/RunProcedure "$(jq -cn --arg p "$PROCEDURE" '{procedure: $p}')")
+            if [ "$code" != 200 ]; then
+              if grep -qi 'busy' "$resp" 2>/dev/null && [ "$(date +%s)" -lt "$fim" ]; then
+                echo "Komodo ocupado (outro deploy da mesma stack ou Procedure). Tento de novo em 30 s."
+                sleep 30; continue
+              fi
+              recusa "$code"; exit 1
+            fi
+            id=$(jq -r '._id."$oid" // .id // empty' "$resp")
+            [ -n "$id" ] || { echo "::error::o Komodo respondeu 200 sem o id da execução"; exit 1; }
+            echo "Procedure $PROCEDURE: execução $id (tentativa $tentativa)"
+
+            while :; do
+              sleep 10
+              code=$(chama /read/GetUpdate "$(jq -cn --arg i "$id" '{id: $i}')")
+              if [ "$code" = 200 ] && [ "$(jq -r '.status' "$resp")" = Complete ]; then break; fi
+              if [ "$(date +%s)" -ge "$fim" ]; then
+                echo "::error::passou de $ESPERA min esperando a execução $id; ela segue no Komodo"; exit 1
+              fi
+            done
+
+            if [ "$(jq -r '.success' "$resp")" = true ]; then
+              seg=$(( $(date +%s) - inicio ))
+              echo "ok: $PROCEDURE terminou em ${seg}s; a troca dos containers segue no Swarm"
+              # shellcheck disable=SC2016  # the backticks are Markdown for the job summary
+              printf '### %s\n\nOk em %ss (execução `%s`). A troca dos containers segue no Swarm; se ela voltar atrás, o alerta do Komodo avisa.\n' \
+                "$PROCEDURE" "$seg" "$id" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if jq -r '[.logs[]? | (.stderr // ""), (.stdout // "")] | join("\n")' "$resp" | grep -qi 'busy' && [ "$(date +%s)" -lt "$fim" ]; then
+              echo "A execução $id parou porque outra estava em andamento. Tento de novo em 30 s."
+              sleep 30; continue
+            fi
+            echo "::error::$PROCEDURE falhou (execução $id). Etapas com erro e o fim do log de cada uma:"
+            jq -r '.logs[]? | select(.success == false) | "--- \(.stage)\n\((.stderr // "") | split("\n") | .[-25:] | join("\n"))"' "$resp"
+            # shellcheck disable=SC2016  # the backticks are Markdown for the job summary
+            printf '### %s\n\nFalhou (execução `%s`). O log está no Komodo e no passo acima.\n' "$PROCEDURE" "$id" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          done

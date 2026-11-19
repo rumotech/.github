@@ -1,0 +1,21 @@
+name: actionlint
+
+# Confere os workflows deste repositório (sintaxe, expressões e o shell de cada `run`, pelo shellcheck que vem na
+# imagem). Os workflows daqui são chamados pelos repositórios da org: um erro aqui quebra todos eles.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: docker run --rm -v "$PWD:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -color
