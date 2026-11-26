@@ -10,13 +10,19 @@ name: komodo-procedure
 # push e não está presa a um commit (o Commit Hash da Build no Komodo); depois, que o commit construído é o deste
 # push. Uma Build presa ou um commit diferente deixam o run vermelho, nunca verde.
 #
+# Numa falha, mostra o motivo lido das execuções filhas (pre deploy e post deploy; das outras etapas, só o link).
+#
 # Genérico e público: o endereço do Komodo, a Procedure, a Build e a chave liga/desliga vêm de quem chama. Os
-# quatro segredos são um token de serviço do Access e a chave de API de um usuário de serviço do Komodo que só
-# pode executar as Procedures dele (e ler as Builds que confere). Usado pelo deploy automático (AIR-673).
+# quatro segredos são um token de serviço do Access e a chave de API de um usuário de serviço do Komodo que pode
+# executar as Procedures dele e ler as Builds e a Stack delas (sem Read, o motivo de uma falha não aparece aqui).
+# Usado pelo deploy automático (AIR-673).
 #
-# Desligado, este workflow termina verde sem chamar nada. Quem não pode mostrar verde sem deploy (a produção)
-# põe a chave também no `if` do job: desligado, o job aparece como pulado.
+# Desligado, este workflow termina verde sem chamar nada, e com `build` termina vermelho: quem promete um deploy
+# (a produção) põe a chave também no `if` do job, e desligado o job aparece como pulado.
 #
+#   concurrency:          # um merge mais novo cancela a espera do anterior (a Procedure constrói a ponta)
+#     group: deploy-prod
+#     cancel-in-progress: true
 #   jobs:
 #     prod:
 #       if: vars.DEPLOY_PROD == 'ligado'
@@ -80,8 +86,15 @@ jobs:
         env:
           LIGADO: ${{ inputs.ligado }}
           PROCEDURE: ${{ inputs.procedure }}
+          BUILD: ${{ inputs.build }}
         run: |
           echo "::notice::Deploy automático desligado (valor: '${LIGADO}'): a Procedure ${PROCEDURE} não foi chamada."
+          # A caller that checks a Build promises a deploy: switched off, it must show skipped (the switch in the
+          # job's `if`), never a green run with nothing shipped.
+          if [ -n "$BUILD" ]; then
+            echo "::error::desligado, mas com build: ponha a mesma chave no if do job, para o run aparecer como pulado e não verde"
+            exit 1
+          fi
 
       - name: Rodar a Procedure e esperar
         if: inputs.ligado == 'ligado'
@@ -113,8 +126,10 @@ jobs:
           printf 'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\nX-Api-Key: %s\nX-Api-Secret: %s\nContent-Type: application/json\n' \
             "$CF_ID" "$CF_SECRET" "$K_KEY" "$K_SECRET" > "$cab"
           resp="$RUNNER_TEMP/komodo-resposta.json"
-          chama() { # chama <path> <json>: prints the HTTP code; the body lands in $resp
-            curl -sS --max-time 30 --max-redirs 0 -o "$resp" -w '%{http_code}' -H @"$cab" -X POST --data "$2" "$url$1" 2>/dev/null || echo 000
+          chama() { # chama <path> <json>: prints the HTTP code (000 without an answer); the body lands in $resp
+            local c
+            c=$(curl -sS --max-time 30 --max-redirs 0 -o "$resp" -w '%{http_code}' -H @"$cab" -X POST --data "$2" "$url$1" 2>/dev/null) || true
+            echo "${c:-000}"
           }
           recusa() { # recusa <code>: why the Access or Komodo said no, never the body of an HTML page
             case "$1" in
@@ -145,6 +160,16 @@ jobs:
           # the same commit forever, and the Procedure would end green without shipping this merge.
           if [ -n "$BUILD" ]; then
             le_build
+            ligado_a=$(jq -r '.config.linked_repo // ""' "$resp")
+            repo_build=$(jq -r '.config.repo // ""' "$resp")
+            if [ -n "$ligado_a" ]; then
+              echo "::error::a Build $BUILD usa o Repo $ligado_a do Komodo; esta conferência só lê branch e commit da própria Build"
+              exit 1
+            fi
+            if [ "$(printf '%s' "$repo_build" | tr '[:upper:]' '[:lower:]')" != "$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')" ]; then
+              echo "::error::a Build $BUILD constrói o repositório [$repo_build], não o $GITHUB_REPOSITORY deste push"
+              exit 1
+            fi
             pino=$(jq -r '.config.commit // ""' "$resp")
             ramo_build=$(jq -r '.config.branch // ""' "$resp")
             if [ -n "$pino" ]; then
@@ -204,25 +229,41 @@ jobs:
               fi
               echo "ok: $PROCEDURE terminou em ${seg}s"
               # shellcheck disable=SC2016  # the backticks are Markdown for the job summary
-              printf '### %s\n\nOk em %ss (execução `%s`).%s\n' "$PROCEDURE" "$seg" "$id" "$entregue" >> "$GITHUB_STEP_SUMMARY"
+              printf '### %s\n\nOk em %ss (execução `%s`).%s A troca no Swarm só está confirmada se a stack espera por ela no post deploy (esperar-troca.sh); sem isso, uma volta aparece no alerta do Komodo.\n' \
+                "$PROCEDURE" "$seg" "$id" "$entregue" >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            if jq -r '[.logs[]? | (.stderr // ""), (.stdout // "")] | join("\n")' "$resp" | grep -qi 'busy' && [ "$(date +%s)" -lt "$fim" ]; then
+            # A failed stage only says "see update: '<host>/updates/<id>'": the reason (a migration pending in the
+            # pre deploy, a rollback in the post deploy, a Build or Stack busy with another run) is in that update.
+            # Read each one once, keeping a copy, before deciding.
+            cp "$resp" "$RUNNER_TEMP/komodo-procedure.json"
+            filhos=$(jq -r '[.logs[]? | (.stderr // ""), (.stdout // "")] | join("\n")' "$resp" \
+              | { grep -oE '/updates/[0-9a-f]{24}' || true; } | sed 's#/updates/##' | sort -u)
+            ocupado=false
+            jq -r '[.logs[]? | (.stderr // ""), (.stdout // "")] | join("\n")' "$resp" | grep -qi 'busy' && ocupado=true
+            for filho in $filhos; do
+              code=$(chama /read/GetUpdate "$(jq -cn --arg i "$filho" '{id: $i}')")
+              if [ "$code" = 200 ]; then
+                cp "$resp" "$RUNNER_TEMP/komodo-filho-$filho.json"
+                jq -r '[.logs[]? | (.stderr // ""), (.stdout // "")] | join("\n")' "$resp" | grep -qi 'busy' && ocupado=true
+              else
+                echo "$code" > "$RUNNER_TEMP/komodo-filho-$filho.erro"
+              fi
+            done
+            if [ "$ocupado" = true ] && [ "$(date +%s)" -lt "$fim" ]; then
               echo "A execução $id parou porque outra estava em andamento. Tento de novo em 30 s."
               sleep 30; continue
             fi
             echo "::error::$PROCEDURE falhou (execução $id). Etapas com erro e o fim do log de cada uma:"
+            cp "$RUNNER_TEMP/komodo-procedure.json" "$resp"
             logs_com_erro
-            # A failed stage only says "see update: '<host>/updates/<id>'": the reason (a migration pending in the
-            # pre deploy, a rollback in the post deploy) is in that update. Show it (see logs_do_filho).
-            for filho in $(jq -r '[.logs[]? | (.stderr // ""), (.stdout // "")] | join("\n")' "$resp" \
-                | { grep -oE '/updates/[0-9a-f]{24}' || true; } | sed 's#/updates/##' | sort -u); do
-              code=$(chama /read/GetUpdate "$(jq -cn --arg i "$filho" '{id: $i}')")
-              if [ "$code" = 200 ]; then
+            for filho in $filhos; do
+              if [ -f "$RUNNER_TEMP/komodo-filho-$filho.json" ]; then
+                cp "$RUNNER_TEMP/komodo-filho-$filho.json" "$resp"
                 echo "=== execução $filho ($(jq -r '.operation // "?"' "$resp"))"
                 logs_do_filho "$filho"
               else
-                echo "=== execução $filho: não deu para ler (HTTP $code)"
+                echo "=== execução $filho: não deu para ler (HTTP $(cat "$RUNNER_TEMP/komodo-filho-$filho.erro"); o usuário de serviço tem Read na Build e na Stack?)"
               fi
             done
             # shellcheck disable=SC2016  # the backticks are Markdown for the job summary
