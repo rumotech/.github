@@ -128,8 +128,17 @@ jobs:
             code=$(chama /read/GetBuild "$(jq -cn --arg b "$BUILD" '{build: $b}')")
             [ "$code" = 200 ] || { echo "::error::não deu para ler a Build $BUILD (o usuário de serviço tem Read nela?)"; recusa "$code"; exit 1; }
           }
-          logs_com_erro() { # logs_com_erro: the failed logs of the update in $resp, last 25 lines of each stream
-            jq -r '.logs[]? | select(.success == false) | "--- \(.stage)", ((.stdout // "") | split("\n") | .[-25:] | join("\n")), ((.stderr // "") | split("\n") | .[-25:] | join("\n"))' "$resp"
+          logs_com_erro() { # logs_com_erro: the failed logs of the procedure update in $resp (Komodo's own messages)
+            jq -r '.logs[]? | select(.success == false) | "--- \(.stage)\n\((.stderr // "") | split("\n") | .[-25:] | join("\n"))"' "$resp"
+          }
+          logs_do_filho() { # logs_do_filho <id>: the failed logs of a child update in $resp
+            # Only Pre Deploy and Post Deploy show their output: they run our deploy scripts, written to print no
+            # value (seuagenteia-core, deploy/comum). Any other stage (a docker build, the stack deploy) may print
+            # what it likes, and this log is read by everyone with access to the calling repo: name and link only.
+            jq -r --arg link "$url/updates/$1" '.logs[]? | select(.success == false)
+              | if (.stage == "Pre Deploy" or .stage == "Post Deploy")
+                then "--- \(.stage)", ((.stdout // "") | split("\n") | .[-25:] | join("\n")), ((.stderr // "") | split("\n") | .[-25:] | join("\n"))
+                else "--- \(.stage): o log fica no Komodo, \($link)" end' "$resp"
           }
 
           # Before: the Build must follow the branch of this push, with no commit pinned. A pinned Build rebuilds
@@ -205,13 +214,13 @@ jobs:
             echo "::error::$PROCEDURE falhou (execução $id). Etapas com erro e o fim do log de cada uma:"
             logs_com_erro
             # A failed stage only says "see update: '<host>/updates/<id>'": the reason (a migration pending in the
-            # pre deploy, a rollback in the post deploy) is in that update. Print the failed logs of each one.
+            # pre deploy, a rollback in the post deploy) is in that update. Show it (see logs_do_filho).
             for filho in $(jq -r '[.logs[]? | (.stderr // ""), (.stdout // "")] | join("\n")' "$resp" \
                 | { grep -oE '/updates/[0-9a-f]{24}' || true; } | sed 's#/updates/##' | sort -u); do
               code=$(chama /read/GetUpdate "$(jq -cn --arg i "$filho" '{id: $i}')")
               if [ "$code" = 200 ]; then
                 echo "=== execução $filho ($(jq -r '.operation // "?"' "$resp"))"
-                logs_com_erro
+                logs_do_filho "$filho"
               else
                 echo "=== execução $filho: não deu para ler (HTTP $code)"
               fi
